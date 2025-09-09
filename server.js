@@ -12,9 +12,12 @@ import Fastify from 'fastify';
 // PORT - Server port (default: 3000)
 // DEEPGRAM_API_KEY - Deepgram API key for ASR
 // ANTHROPIC_API_KEY - Claude API key
-// ELEVENLABS_API_KEY - ElevenLabs API key for TTS
+// ELEVEN_API_KEY - ElevenLabs API key for TTS
+// ELEVEN_VOICE_ID - ElevenLabs voice ID
 // SUPABASE_URL - Supabase project URL
 // SUPABASE_SERVICE_ROLE - Supabase service role key
+// JWT_SECRET - Secret string for signing tokens
+
 
 
      const fastify = Fastify({ logger: true });
