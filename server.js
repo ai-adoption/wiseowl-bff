@@ -8,16 +8,14 @@ import Fastify from 'fastify';
      import Anthropic from '@anthropic-ai/sdk';
      import { fetch } from 'undici';
 
-     // Required environment variables:
-     // PORT - Server port (default: 3000)
-     // DEEPGRAM_API_KEY - Deepgram API key for 
-     ASR
-     // ANTHROPIC_API_KEY - Claude API key
-     // ELEVENLABS_API_KEY - ElevenLabs API key 
-     for TTS
-     // SUPABASE_URL - Supabase project URL
-     // SUPABASE_SERVICE_ROLE - Supabase service 
-     role key
+// Required environment variables:
+// PORT - Server port (default: 3000)
+// DEEPGRAM_API_KEY - Deepgram API key for ASR
+// ANTHROPIC_API_KEY - Claude API key
+// ELEVENLABS_API_KEY - ElevenLabs API key for TTS
+// SUPABASE_URL - Supabase project URL
+// SUPABASE_SERVICE_ROLE - Supabase service role key
+
 
      const fastify = Fastify({ logger: true });
      const port = process.env.PORT || 3000;
