@@ -1,475 +1,337 @@
+/**
+ * WiseOwl BFF — server.js
+ * Fastify HTTP server + WebSocket bridge for Twilio Media Streams
+ * Deepgram (ASR) → Anthropic Claude (reasoning) → ElevenLabs (TTS)
+ * Supabase for persistence
+ *
+ * Env vars required:
+ *  PORT                   - server port (Render provides one)
+ *  DEEPGRAM_API_KEY       - Deepgram API key for ASR
+ *  ANTHROPIC_API_KEY      - Claude API key
+ *  CLAUDE_MODEL           - Claude model id (e.g., claude-3-7-sonnet-latest)
+ *  ELEVEN_API_KEY         - ElevenLabs API key (TTS)
+ *  ELEVEN_VOICE_ID        - ElevenLabs voice id
+ *  SUPABASE_URL           - Supabase project URL
+ *  SUPABASE_SERVICE_ROLE  - Supabase service role key
+ *  JWT_SECRET             - (optional) secret for future WS auth
+ */
+
 import Fastify from 'fastify';
-     import { WebSocketServer } from 'ws';
-     import { createClient } from
-     '@deepgram/sdk';
-     import { createClient as
-     createSupabaseClient } from
-     '@supabase/supabase-js';
-     import Anthropic from '@anthropic-ai/sdk';
-     import { fetch } from 'undici';
+import { WebSocketServer, WebSocket } from 'ws';
+import { createClient as createDeepgramClient } from '@deepgram/sdk';
+import { createClient as createSupabaseClient } from '@supabase/supabase-js';
+import Anthropic from '@anthropic-ai/sdk';
+import { fetch } from 'undici'; // kept for completeness; SDKs use fetch internally
 
-// Required environment variables:
-// PORT - Server port (default: 3000)
-// DEEPGRAM_API_KEY - Deepgram API key for ASR
-// ANTHROPIC_API_KEY - Claude API key
-// ELEVEN_API_KEY - ElevenLabs API key for TTS
-// ELEVEN_VOICE_ID - ElevenLabs voice ID
-// SUPABASE_URL - Supabase project URL
-// SUPABASE_SERVICE_ROLE - Supabase service role key
-// JWT_SECRET - Secret string for signing tokens
+// -------------------- Setup clients --------------------
+const fastify = Fastify({ logger: true });
+const port = process.env.PORT || 3000;
 
+const deepgram = createDeepgramClient(process.env.DEEPGRAM_API_KEY);
+const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+const supabase = createSupabaseClient(
+  process.env.SUPABASE_URL,
+  process.env.SUPABASE_SERVICE_ROLE
+);
 
+// -------------------- Health --------------------
+fastify.get('/health', async () => ({
+  status: 'ok',
+  timestamp: new Date().toISOString(),
+}));
 
-     const fastify = Fastify({ logger: true });
-     const port = process.env.PORT || 3000;
+// -------------------- Helpers --------------------
+const chunkUlaw = (buf, size = 160) => {
+  const chunks = [];
+  for (let i = 0; i < buf.length; i += size) chunks.push(buf.slice(i, i + size));
+  return chunks;
+};
 
-     // Initialize clients
-     const deepgram =
-     createClient(process.env.DEEPGRAM_API_KEY);
-     const anthropic = new Anthropic({ apiKey:
-     process.env.ANTHROPIC_API_KEY });
-     const supabase = createSupabaseClient(proces
-     s.env.SUPABASE_URL,
-     process.env.SUPABASE_SERVICE_ROLE);
+const sendClear = (ws) => ws.send(JSON.stringify({ event: 'clear' }));
+const sendMark = (ws, name = 'playback_complete') =>
+  ws.send(JSON.stringify({ event: 'mark', mark: { name } }));
 
-     // Health check endpoint
-     fastify.get('/health', async (request,
-     reply) => {
-       return { status: 'ok', timestamp: new
-     Date().toISOString() };
-     });
-
-     // Start server
-     const start = async () => {
-       try {
-         await fastify.listen({ port, host:
-     '0.0.0.0' });
-         console.log(`Server running on port 
-     ${port}`);
-
-         // WebSocket server for Twilio Media 
-     Streams
-         const wss = new WebSocketServer({
-     server: fastify.server, path: '/stream' });
-
-         wss.on('connection', async (ws, req) =>
-     {
-           const callSid = new URL(req.url,
-     `http://${req.headers.host}`).searchParams.g
-     et('callSid');
-           console.log(`Media stream started for 
-     CallSid: ${callSid}`);
-
-           let currentCall = null;
-           let currentTurn = null;
-           let transcriptBuffer = '';
-           let isProcessing = false;
-           let elevenLabsWs = null;
-
-           // Initialize call record in Supabase
-           const initCall = async () => {
-             const { data, error } = await
-     supabase
-               .from('calls')
-               .insert([{ call_sid: callSid,
-     status: 'active', started_at: new Date() }])
-               .select()
-               .single();
-
-             if (error) {
-               console.error('Error creating call
-      record:', error);
-               return null;
-             }
-             return data;
-           };
-
-           currentCall = await initCall();
-
-           // Connect to Deepgram with µ-law 
-     configuration
-           const dgConnection =
-     deepgram.listen.live({
-             encoding: 'mulaw',
-             sample_rate: 8000,
-             interim_results: true,
-             smart_format: true,
-             endpointing: 1500,
-             utterance_end_ms: 1200,
-             channels: 1,
-             model: 'nova-2'
-           });
-
-           // Connect to ElevenLabs WebSocket for
-      TTS
-           const connectElevenLabs = () => {
-             const wsUrl =
-     `wss://api.elevenlabs.io/v1/text-to-speech/p
-     NInz6obpgDQGcFmaJgB/stream-input?model_id=el
-     even_turbo_v2_5&output_format=ulaw_8000`;
-             elevenLabsWs = new WebSocket(wsUrl);
-
-             elevenLabsWs.on('open', () => {
-               console.log('ElevenLabs WebSocket 
-     connected');
-               // Send initial configuration
-               elevenLabsWs.send(JSON.stringify({
-                 text: ' ',
-                 voice_settings: { stability:
-     0.5, similarity_boost: 0.8 },
-                 generation_config: {
-                   chunk_length_schedule: [120,
-     160, 250, 290]
-                 }
-               }));
-             });
-
-             elevenLabsWs.on('message', (data) =>
+// Persist a turn; non-blocking on failure
+async function persistTurn({ call_sid, role, text, meta }) {
+  try {
+    await supabase.from('turns').insert([
       {
-               try {
-                 const message =
-     JSON.parse(data);
-                 if (message.audio) {
-                   // Convert base64 audio to 
-     µ-law and send to Twilio in 20ms chunks (160
-      bytes)
-                   const audioBuffer =
-     Buffer.from(message.audio, 'base64');
-                   const chunkSize = 160; // 20ms
-      at 8kHz µ-law
+        call_sid,
+        role,
+        text,
+        meta,
+      },
+    ]);
+  } catch (e) {
+    console.error('persistTurn error:', e);
+  }
+}
 
-                   for (let i = 0; i <
-     audioBuffer.length; i += chunkSize) {
-                     const chunk =
-     audioBuffer.slice(i, i + chunkSize);
-                     const payload =
-     chunk.toString('base64');
+// Upsert call row
+async function ensureCall(call_sid) {
+  try {
+    const { data } = await supabase
+      .from('calls')
+      .upsert({ call_sid }, { onConflict: 'call_sid' })
+      .select()
+      .single();
+    return data;
+  } catch (e) {
+    console.error('ensureCall error:', e);
+    return null;
+  }
+}
 
-                     ws.send(JSON.stringify({
-                       event: 'media',
-                       media: { payload }
-                     }));
-                   }
-                 }
+// -------------------- ElevenLabs WS (TTS) --------------------
+function openElevenLabsWS() {
+  const voiceId = process.env.ELEVEN_VOICE_ID;
+  const model = 'eleven_turbo_v2_5';
+  const output = 'ulaw_8000';
+  const url = `wss://api.elevenlabs.io/v1/text-to-speech/${voiceId}/stream-input?model_id=${model}&output_format=${output}`;
 
-                 if (message.isFinal) {
-                   // Send mark after playback 
-     completion
-                   ws.send(JSON.stringify({
-                     event: 'mark',
-                     mark: { name:
-     'playback_complete' }
-                   }));
-                 }
-               } catch (error) {
-                 console.error('Error processing 
-     ElevenLabs audio:', error);
-               }
-             });
+  const ws = new WebSocket(url, {
+    headers: { 'xi-api-key': process.env.ELEVEN_API_KEY },
+  });
 
-             elevenLabsWs.on('error', (error) =>
-     {
-               console.error('ElevenLabs 
-     WebSocket error:', error);
-             });
+  ws.on('open', () => {
+    // optional initial config frame (kept minimal)
+    ws.send(
+      JSON.stringify({
+        text: ' ',
+        voice_settings: { stability: 0.5, similarity_boost: 0.8 },
+        generation_config: { chunk_length_schedule: [120, 160, 250, 290] },
+      })
+    );
+  });
 
-             elevenLabsWs.on('close', () => {
-               console.log('ElevenLabs WebSocket 
-     closed');
-             });
-           };
+  return ws;
+}
 
-           connectElevenLabs();
+// -------------------- Deepgram Live --------------------
+function openDeepgramLive() {
+  return deepgram.listen.live({
+    model: 'nova-2',
+    encoding: 'mulaw',
+    sample_rate: 8000,
+    channels: 1,
+    interim_results: true,
+    smart_format: true,
+    endpointing: 1500,
+    utterance_end_ms: 1200,
+  });
+}
 
-           // Deepgram event handlers
-           dgConnection.on('open', () => {
-             console.log('Deepgram connection 
-     opened');
-           });
+// -------------------- Claude reasoning --------------------
+async function reasonWithClaude(transcript) {
+  try {
+    const toolName = 'decide_and_respond';
+    const res = await anthropic.messages.create({
+      model: process.env.CLAUDE_MODEL || 'claude-3-7-sonnet-latest',
+      max_tokens: 800,
+      messages: [
+        {
+          role: 'user',
+          content: `You are a polite, concise AI receptionist. Given this caller text, produce a structured response.\n\nCaller: "${transcript}"`,
+        },
+      ],
+      tools: [
+        {
+          name: toolName,
+          description:
+            'Decide the caller intent, produce a brief response text, whether to escalate, and any extracted slots.',
+          input_schema: {
+            type: 'object',
+            properties: {
+              intent: { type: 'string' },
+              response_text: { type: 'string' },
+              escalate: { type: 'boolean' },
+              slots: { type: 'object', additionalProperties: { type: 'string' } },
+            },
+            required: ['intent', 'response_text', 'escalate', 'slots'],
+          },
+        },
+      ],
+      tool_choice: { type: 'tool', name: toolName },
+    });
 
-           dgConnection.on('transcript', async
-     (data) => {
-             const transcript =
-     data.channel?.alternatives?.[0]?.transcript;
-             if (!transcript) return;
+    // Extract tool output (with simple auto-repair)
+    let result = {
+      intent: 'unknown',
+      response_text: "I'm here to help. How can I assist you?",
+      escalate: false,
+      slots: {},
+    };
 
-             if (data.is_final ||
-     data.speech_final) {
-               transcriptBuffer += transcript + '
-      ';
-               console.log(`Final transcript: 
-     ${transcript}`);
+    const content = res?.content?.[0];
+    if (content?.type === 'tool_use' && content?.input) {
+      const i = content.input;
+      result.intent = typeof i.intent === 'string' ? i.intent : result.intent;
+      result.response_text =
+        typeof i.response_text === 'string' ? i.response_text : result.response_text;
+      result.escalate = typeof i.escalate === 'boolean' ? i.escalate : result.escalate;
+      result.slots = i.slots && typeof i.slots === 'object' ? i.slots : result.slots;
+    }
 
-               // Process with Claude on final 
-     transcript
-               if (!isProcessing) {
-                 isProcessing = true;
-                 await
-     processWithClaude(transcriptBuffer.trim());
-                 transcriptBuffer = '';
-                 isProcessing = false;
-               }
-             } else {
-               console.log(`Interim: 
-     ${transcript}`);
-             }
-           });
+    return result;
+  } catch (e) {
+    console.error('Claude reasoning error:', e);
+    return {
+      intent: 'fallback',
+      response_text: "I'm sorry, could you please repeat that?",
+      escalate: false,
+      slots: {},
+    };
+  }
+}
 
-           dgConnection.on('utteranceEnd', async
-     () => {
-             if (transcriptBuffer.trim() &&
-     !isProcessing) {
-               isProcessing = true;
-               await
-     processWithClaude(transcriptBuffer.trim());
-               transcriptBuffer = '';
-               isProcessing = false;
-             }
-           });
+// -------------------- WebSocket: /stream (Twilio Media Streams) --------------------
+async function start() {
+  try {
+    await fastify.listen({ port, host: '0.0.0.0' });
+    console.log(`WiseOwl BFF running on ${port}`);
 
-           dgConnection.on('error', (error) => {
-             console.error('Deepgram error:',
-     error);
-           });
+    const wss = new WebSocketServer({ server: fastify.server, path: '/stream' });
 
-           // Process transcript with Claude
-           const processWithClaude = async
-     (transcript) => {
-             try {
-               // Save user turn to database
-               const { data: userTurn } = await
-     supabase
-                 .from('turns')
-                 .insert([{
-                   call_id: currentCall?.id,
-                   role: 'user',
-                   content: transcript,
-                   created_at: new Date()
-                 }])
-                 .select()
-                 .single();
+    wss.on('connection', async (ws, req) => {
+      // Parse CallSid from query
+      const u = new URL(req.url, `http://${req.headers.host}`);
+      const callSid = u.searchParams.get('callSid') || 'unknown';
+      console.log('Twilio WS connected:', callSid);
 
-               // Call Claude with tool schema
-               const response = await
-     anthropic.messages.create({
-                 model:
-     'claude-3-5-sonnet-20241022',
-                 max_tokens: 1000,
-                 messages: [
-                   {
-                     role: 'user',
-                     content: `You are an AI 
-     receptionist. Process this caller input and 
-     respond appropriately: "${transcript}"`
-                   }
-                 ],
-                 tools: [
-                   {
-                     name:
-     'receptionist_response',
-                     description: 'Generate a 
-     structured response for the AI 
-     receptionist',
-                     input_schema: {
-                       type: 'object',
-                       properties: {
-                         intent: {
-                           type: 'string',
-                           description: 'The 
-     detected intent (e.g., appointment_request, 
-     question, greeting)'
-                         },
-                         response_text: {
-                           type: 'string',
-                           description: 'The text
-      response to speak to the caller'
-                         },
-                         escalate: {
-                           type: 'boolean',
-                           description: 'Whether 
-     to escalate to a human agent'
-                         },
-                         slots: {
-                           type: 'object',
-                           description:
-     'Extracted entities and values from the 
-     input',
-                           additionalProperties:
-     true
-                         }
-                       },
-                       required: ['intent',
-     'response_text', 'escalate', 'slots']
-                     }
-                   }
-                 ],
-                 tool_choice: { type: 'tool',
-     name: 'receptionist_response' }
-               });
+      // Session state
+      let transcriptBuffer = '';
+      let speaking = false;
+      let dg = openDeepgramLive();
+      let eleven = openElevenLabsWS();
 
-               let result;
-               if (response.content[0].type ===
-     'tool_use') {
-                 result =
-     response.content[0].input;
-               } else {
-                 // Auto-repair: create fallback 
-     response if tool wasn't used
-                 result = {
-                   intent: 'unknown',
-                   response_text: 'I understand. 
-     How can I help you today?',
-                   escalate: false,
-                   slots: {}
-                 };
-               }
+      // DB: ensure call row exists
+      await ensureCall(callSid);
 
-               // Validate and auto-repair schema
-               if (!result.intent) result.intent
-     = 'unknown';
-               if (!result.response_text)
-     result.response_text = 'How can I help 
-     you?';
-               if (typeof result.escalate !==
-     'boolean') result.escalate = false;
-               if (!result.slots || typeof
-     result.slots !== 'object') result.slots =
-     {};
+      // Deepgram events
+      dg.on('open', () => console.log('Deepgram live: open'));
+      dg.on('error', (e) => console.error('Deepgram error:', e));
+      dg.on('close', () => console.log('Deepgram live: closed'));
 
-               console.log(`Claude response: 
-     ${JSON.stringify(result)}`);
+      dg.on('transcript', async (msg) => {
+        const alt = msg?.channel?.alternatives?.[0];
+        const text = alt?.transcript || '';
+        if (!text) return;
 
-               // Save assistant turn and intent
-               await Promise.all([
-                 supabase.from('turns').insert([{
-                   call_id: currentCall?.id,
-                   role: 'assistant',
-                   content: result.response_text,
-                   created_at: new Date()
-                 }]),
+        if (msg.is_final || msg.speech_final) {
+          transcriptBuffer += text + ' ';
+          // Got a full piece of speech → reason → speak
+          const userText = transcriptBuffer.trim();
+          transcriptBuffer = '';
 
-     supabase.from('intents').insert([{
-                   call_id: currentCall?.id,
-                   intent: result.intent,
-                   confidence: 1.0,
-                   slots: result.slots,
-                   escalate: result.escalate,
-                   created_at: new Date()
-                 }])
-               ]);
+          // Persist user turn
+          persistTurn({ call_sid: callSid, role: 'user', text: userText, meta: { final: true } });
 
-               // Send response to ElevenLabs for
-      TTS
-               if (elevenLabsWs &&
-     elevenLabsWs.readyState === WebSocket.OPEN)
-     {
-                 // Send clear command for 
-     barge-in capability
-                 ws.send(JSON.stringify({ event:
-     'clear' }));
+          const result = await reasonWithClaude(userText);
 
-                 // Send text to ElevenLabs
+          // Persist assistant + intents
+          persistTurn({
+            call_sid: callSid,
+            role: 'assistant',
+            text: result.response_text,
+            meta: { intent: result.intent, escalate: result.escalate, slots: result.slots },
+          });
+          try {
+            await supabase.from('intents').insert([
+              {
+                call_sid: callSid,
+                intent: result.intent,
+                escalate: result.escalate,
+                slots: result.slots,
+              },
+            ]);
+          } catch (e) {
+            console.error('persist intent error:', e);
+          }
 
-     elevenLabsWs.send(JSON.stringify({
-                   text: result.response_text,
-                   try_trigger_generation: true
-                 }));
-               }
+          // Barge-in: clear any current playback
+          if (speaking) sendClear(ws);
 
-             } catch (error) {
-               console.error('Error processing 
-     with Claude:', error);
+          // Speak via ElevenLabs
+          if (eleven.readyState === WebSocket.OPEN) {
+            speaking = true;
+            eleven.send(JSON.stringify({ text: result.response_text, try_trigger_generation: true }));
+          }
+        } else {
+          // interim: barge-in if caller starts talking while TTS
+          if (!speaking) return;
+          sendClear(ws);
+          speaking = false;
+        }
+      });
 
-               // Fallback response
-               const fallbackText = "I'm sorry, I
-      didn't catch that. Could you please 
-     repeat?";
-               if (elevenLabsWs &&
-     elevenLabsWs.readyState === WebSocket.OPEN)
-     {
+      // ElevenLabs audio → Twilio
+      eleven.on('message', (data) => {
+        try {
+          const m = JSON.parse(data.toString());
+          if (m?.audio) {
+            const audio = Buffer.from(m.audio, 'base64');
+            // send as 20ms µ-law frames (160 bytes @ 8kHz)
+            for (const chunk of chunkUlaw(audio, 160)) {
+              ws.send(JSON.stringify({ event: 'media', media: { payload: chunk.toString('base64') } }));
+            }
+          }
+          if (m?.isFinal) {
+            sendMark(ws, 'tts_done');
+            speaking = false;
+          }
+        } catch (e) {
+          // Sometimes ElevenLabs sends non-JSON keepalives; ignore
+        }
+      });
+      eleven.on('open', () => console.log('ElevenLabs WS: open'));
+      eleven.on('error', (e) => console.error('ElevenLabs WS error:', e));
+      eleven.on('close', () => console.log('ElevenLabs WS: closed'));
 
-     elevenLabsWs.send(JSON.stringify({
-                   text: fallbackText,
-                   try_trigger_generation: true
-                 }));
-               }
-             }
-           };
+      // Twilio → events
+      ws.on('message', (raw) => {
+        try {
+          const msg = JSON.parse(raw.toString());
+          if (msg.event === 'start') {
+            console.log('Twilio start:', msg?.start?.streamSid);
+          } else if (msg.event === 'media') {
+            // Forward audio to Deepgram (base64 µ-law)
+            if (dg?.readyState === WebSocket.OPEN) {
+              const buf = Buffer.from(msg.media.payload, 'base64');
+              dg.send(buf);
+            }
+          } else if (msg.event === 'stop') {
+            console.log('Twilio stop');
+            ws.close();
+          }
+        } catch (e) {
+          console.error('WS message parse error:', e);
+        }
+      });
 
-           // Handle Twilio WebSocket messages
-           ws.on('message', (data) => {
-             try {
-               const message = JSON.parse(data);
+      ws.on('close', async () => {
+        try {
+          dg?.finish?.();
+        } catch (_) {}
+        try {
+          if (eleven?.readyState === WebSocket.OPEN) eleven.close();
+        } catch (_) {}
+        try {
+          await supabase
+            .from('calls')
+            .update({ ended_at: new Date() })
+            .eq('call_sid', callSid);
+        } catch (e) {
+          console.error('update call end error:', e);
+        }
+        console.log('Twilio WS closed:', callSid);
+      });
 
-               switch (message.event) {
-                 case 'start':
-                   console.log('Twilio stream 
-     started:', message.start.streamSid);
-                   break;
+      ws.on('error', (e) => console.error('Twilio WS error:', e));
+    });
+  } catch (err) {
+    fastify.log.error(err);
+    process.exit(1);
+  }
+}
 
-                 case 'media':
-                   // Forward µ-law audio to 
-     Deepgram
-                   if (dgConnection &&
-     dgConnection.readyState === WebSocket.OPEN)
-     {
-                     const audioBuffer =
-     Buffer.from(message.media.payload,
-     'base64');
-
-     dgConnection.send(audioBuffer);
-                   }
-                   break;
-
-                 case 'stop':
-                   console.log('Twilio stream 
-     stopped');
-                   break;
-
-                 case 'mark':
-                   console.log('Mark received:',
-     message.mark.name);
-                   break;
-               }
-             } catch (error) {
-               console.error('Error processing 
-     Twilio message:', error);
-             }
-           });
-
-           // Handle WebSocket close
-           ws.on('close', async () => {
-             console.log(`WebSocket closed for 
-     CallSid: ${callSid}`);
-
-             // Cleanup connections
-             if (dgConnection)
-     dgConnection.finish();
-             if (elevenLabsWs)
-     elevenLabsWs.close();
-
-             // Update call status
-             if (currentCall) {
-               await supabase
-                 .from('calls')
-                 .update({ status: 'completed',
-     ended_at: new Date() })
-                 .eq('id', currentCall.id);
-             }
-           });
-
-           // Handle errors
-           ws.on('error', (error) => {
-             console.error('WebSocket error:',
-     error);
-           });
-         });
-
-       } catch (err) {
-         fastify.log.error(err);
-         process.exit(1);
-       }
-     };
-
-     start();
-
+start();
