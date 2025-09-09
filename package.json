@@ -1,0 +1,21 @@
+{
+  "name": "wiseowl-bff",
+  "version": "1.0.0",
+  "description": "WiseOwl Receptionist BFF server for Twilio Media Streams, Deepgram, Claude, ElevenLabs, and Supabase",
+  "main": "server.js",
+  "type": "module",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18.18.0"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.27.0",
+    "@deepgram/sdk": "^3.7.0",
+    "@supabase/supabase-js": "^2.45.0",
+    "fastify": "^4.27.0",
+    "undici": "^6.18.1",
+    "ws": "^8.18.0"
+  }
+}
