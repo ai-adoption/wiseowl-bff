@@ -50,13 +50,19 @@ async function start() {
 
   wss.on('connection', async (twilioWS, req) => {
     const params = new URL(req.url, `http://${req.headers.host}`).searchParams;
-    const callSid = params.get('callSid') || 'unknown';
+    let callSid = params.get('callSid') || 'unknown';
+    
+    // If no callSid in URL, generate a unique ID for this session
+    if (callSid === 'unknown') {
+      callSid = `direct_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+    }
     
     // Debug: log full URL and parameters
     fastify.log.info({ 
       callSid, 
       fullUrl: req.url,
-      allParams: Object.fromEntries(params.entries())
+      allParams: Object.fromEntries(params.entries()),
+      headers: req.headers
     }, 'Twilio WS connected');
 
     // ----- Supabase: open call record -----
