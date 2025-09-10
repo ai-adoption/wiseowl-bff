@@ -60,13 +60,16 @@ async function start() {
     try {
       const { data, error } = await supabase
         .from('calls')
-        .insert([{ call_sid: callSid, status: 'active', started_at: new Date() }])
+        .upsert(
+          { call_sid: callSid, status: 'active', started_at: new Date() },
+          { onConflict: 'call_sid' }
+        )
         .select()
         .single();
       if (error) throw error;
       currentCall = data;
     } catch (e) {
-      fastify.log.warn({ err: e, callSid }, 'Supabase: could not insert calls row');
+      fastify.log.warn({ err: e, callSid }, 'Supabase: could not upsert calls row');
     }
 
     // ----- Deepgram: listen.live (μ-law 8kHz mono) -----
@@ -113,20 +116,13 @@ async function start() {
         })
       );
 
-      // Optional: greet the caller immediately
-      elevenWS.send(
-        JSON.stringify({
-          text: "Hi—you're through to WiseOwl. How can I help today?",
-          try_trigger_generation: true,
-        })
-      );
     });
 
     elevenWS.on('message', (data) => {
       // ElevenLabs realtime messages are JSON; audio frames are base64 μ-law
       try {
         const msg = JSON.parse(data.toString('utf8'));
-        if (msg.audio) {
+        if (msg.audio && twilioReady) {
           const audio = Buffer.from(msg.audio, 'base64');
           for (const chunk of ulawChunks(audio)) {
             twilioSend(twilioWS, { event: 'media', media: { payload: chunk.toString('base64') } });
@@ -287,6 +283,9 @@ async function start() {
       }
     });
 
+    // ----- Twilio sync state -----
+    let twilioReady = false;
+
     // ----- Twilio WS messages -----
     twilioWS.on('message', (raw) => {
       try {
@@ -295,6 +294,16 @@ async function start() {
         switch (msg.event) {
           case 'start':
             fastify.log.info({ callSid, streamSid: msg.start?.streamSid }, 'Twilio stream started');
+            twilioReady = true;
+            twilioSend(twilioWS, { event: 'clear' });
+            if (elevenWS.readyState === WebSocket.OPEN) {
+              elevenWS.send(
+                JSON.stringify({
+                  text: process.env.WELCOME_MESSAGE || "Hi, you're through to WiseOwl. How can I help?",
+                  try_trigger_generation: true,
+                })
+              );
+            }
             break;
 
           case 'media': {
