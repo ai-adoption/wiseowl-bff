@@ -107,6 +107,8 @@ async function start() {
 
     elevenWS.on('open', () => {
       fastify.log.info({ callSid }, 'ElevenLabs WS: open');
+      elevenReady = true;
+      
       // Prime session to reduce first-audio latency
       elevenWS.send(
         JSON.stringify({
@@ -116,6 +118,18 @@ async function start() {
         })
       );
       fastify.log.info({ callSid }, 'ElevenLabs: sent init message');
+      
+      // Send welcome message immediately as fallback (don't wait for Twilio start)
+      setTimeout(() => {
+        const welcomeText = process.env.WELCOME_MESSAGE || "Hello, this is WiseOwl speaking. How can I help you today?";
+        fastify.log.info({ callSid, welcomeText }, 'ElevenLabs: sending immediate welcome message');
+        elevenWS.send(
+          JSON.stringify({
+            text: welcomeText,
+            try_trigger_generation: true,
+          })
+        );
+      }, 1000);
     });
 
     elevenWS.on('message', (data) => {
@@ -126,16 +140,13 @@ async function start() {
           const audio = Buffer.from(msg.audio, 'base64');
           fastify.log.debug({ callSid, audioBytes: audio.length, twilioReady }, 'ElevenLabs: received audio');
           
-          if (twilioReady) {
-            let chunkCount = 0;
-            for (const chunk of ulawChunks(audio)) {
-              twilioSend(twilioWS, { event: 'media', media: { payload: chunk.toString('base64') } });
-              chunkCount++;
-            }
-            fastify.log.debug({ callSid, chunkCount }, 'ElevenLabs: forwarded audio chunks to Twilio');
-          } else {
-            fastify.log.warn({ callSid }, 'ElevenLabs: audio received but Twilio not ready');
+          // Send audio regardless of twilioReady state - let Twilio buffer it
+          let chunkCount = 0;
+          for (const chunk of ulawChunks(audio)) {
+            twilioSend(twilioWS, { event: 'media', media: { payload: chunk.toString('base64') } });
+            chunkCount++;
           }
+          fastify.log.debug({ callSid, chunkCount, twilioReady }, 'ElevenLabs: forwarded audio chunks to Twilio');
         }
         if (msg.isFinal) {
           fastify.log.debug({ callSid }, 'ElevenLabs: generation complete');
@@ -295,6 +306,7 @@ async function start() {
 
     // ----- Twilio sync state -----
     let twilioReady = false;
+    let elevenReady = false;
 
     // ----- Twilio WS messages -----
     twilioWS.on('message', (raw) => {
