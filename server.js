@@ -87,12 +87,63 @@ wss.on('connection', async (twilioWS, req) => {
   let buffer = '';
   let processing = false;
 
-  // === ElevenLabs realtime TTS ===
-  const { default: WebSocket } = await import('ws');
-  const elevenURL = `wss://api.elevenlabs.io/v1/text-to-speech/${ELEVEN_VOICE_ID}/stream-input?model_id=eleven_turbo_v2_5&output_format=ulaw_8000`;
-  const elevenWS = new WebSocket(elevenURL, {
-    headers: { 'xi-api-key': ELEVEN_API_KEY }
-  });
+ // === ElevenLabs realtime TTS ===
+const { default: WebSocket } = await import('ws');
+
+const elevenURL = `wss://api.elevenlabs.io/v1/realtime/sse?voice_id=${process.env.ELEVEN_VOICE_ID}&model_id=eleven_turbo_v2_5&output_format=ulaw_8000`;
+
+const elevenWS = new WebSocket(elevenURL, {
+  headers: {
+    'xi-api-key': process.env.ELEVEN_API_KEY,
+    'Accept': 'application/json'
+  }
+});
+
+// Keep ping alive
+const elevenPing = setInterval(() => {
+  if (elevenWS.readyState === WebSocket.OPEN) {
+    elevenWS.ping();
+  }
+}, 20000);
+
+elevenWS.on('open', () => {
+  fastify.log.info('ElevenLabs WS connected');
+  // Optional: prime session
+  elevenWS.send(JSON.stringify({
+    text: " ",
+    voice_settings: { stability: 0.5, similarity_boost: 0.8 },
+    generation_config: { chunk_length_schedule: [120, 160, 250, 290] }
+  }));
+});
+
+elevenWS.on('message', (data) => {
+  try {
+    const msg = JSON.parse(data.toString('utf8'));
+    if (msg.audio) {
+      const audio = Buffer.from(msg.audio, 'base64');
+      for (const chunk of ulawChunks(audio)) {
+        twilioSend(twilioWS, {
+          event: 'media',
+          media: { payload: chunk.toString('base64') }
+        });
+      }
+    }
+    if (msg.isFinal) {
+      twilioSend(twilioWS, { event: 'mark', mark: { name: 'playback_complete' } });
+    }
+  } catch (err) {
+    fastify.log.error({ err }, 'ElevenLabs message error');
+  }
+});
+
+elevenWS.on('close', () => {
+  fastify.log.info('ElevenLabs WS closed');
+  clearInterval(elevenPing);
+});
+
+elevenWS.on('error', (err) => {
+  fastify.log.error({ err }, 'ElevenLabs WS error');
+});
 
   const elevenPing = setInterval(() => {
     if (elevenWS.readyState === WS_OPEN) {
