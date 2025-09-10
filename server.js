@@ -115,20 +115,30 @@ async function start() {
           generation_config: { chunk_length_schedule: [120, 160, 250, 290] },
         })
       );
-
+      fastify.log.info({ callSid }, 'ElevenLabs: sent init message');
     });
 
     elevenWS.on('message', (data) => {
       // ElevenLabs realtime messages are JSON; audio frames are base64 μ-law
       try {
         const msg = JSON.parse(data.toString('utf8'));
-        if (msg.audio && twilioReady) {
+        if (msg.audio) {
           const audio = Buffer.from(msg.audio, 'base64');
-          for (const chunk of ulawChunks(audio)) {
-            twilioSend(twilioWS, { event: 'media', media: { payload: chunk.toString('base64') } });
+          fastify.log.debug({ callSid, audioBytes: audio.length, twilioReady }, 'ElevenLabs: received audio');
+          
+          if (twilioReady) {
+            let chunkCount = 0;
+            for (const chunk of ulawChunks(audio)) {
+              twilioSend(twilioWS, { event: 'media', media: { payload: chunk.toString('base64') } });
+              chunkCount++;
+            }
+            fastify.log.debug({ callSid, chunkCount }, 'ElevenLabs: forwarded audio chunks to Twilio');
+          } else {
+            fastify.log.warn({ callSid }, 'ElevenLabs: audio received but Twilio not ready');
           }
         }
         if (msg.isFinal) {
+          fastify.log.debug({ callSid }, 'ElevenLabs: generation complete');
           // mark after playback complete (helps keep Twilio/Eleven state in sync)
           twilioSend(twilioWS, { event: 'mark', mark: { name: 'playback_complete' } });
         }
@@ -296,14 +306,22 @@ async function start() {
             fastify.log.info({ callSid, streamSid: msg.start?.streamSid }, 'Twilio stream started');
             twilioReady = true;
             twilioSend(twilioWS, { event: 'clear' });
-            if (elevenWS.readyState === WebSocket.OPEN) {
-              elevenWS.send(
-                JSON.stringify({
-                  text: process.env.WELCOME_MESSAGE || "Hi, you're through to WiseOwl. How can I help?",
-                  try_trigger_generation: true,
-                })
-              );
-            }
+            
+            // Wait a moment for Twilio to be fully ready, then send welcome
+            setTimeout(() => {
+              if (elevenWS.readyState === WebSocket.OPEN) {
+                const welcomeText = process.env.WELCOME_MESSAGE || "Hello, this is WiseOwl speaking. How can I help you today?";
+                fastify.log.info({ callSid, welcomeText }, 'Sending welcome message to ElevenLabs');
+                elevenWS.send(
+                  JSON.stringify({
+                    text: welcomeText,
+                    try_trigger_generation: true,
+                  })
+                );
+              } else {
+                fastify.log.warn({ callSid, readyState: elevenWS.readyState }, 'ElevenLabs not ready for welcome message');
+              }
+            }, 500);
             break;
 
           case 'media': {
