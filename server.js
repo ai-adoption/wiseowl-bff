@@ -121,14 +121,24 @@ async function start() {
       
       // Send welcome message immediately as fallback (don't wait for Twilio start)
       setTimeout(() => {
-        const welcomeText = process.env.WELCOME_MESSAGE || "Hello, this is WiseOwl speaking. How can I help you today?";
-        fastify.log.info({ callSid, welcomeText }, 'ElevenLabs: sending immediate welcome message');
-        elevenWS.send(
-          JSON.stringify({
-            text: welcomeText,
-            try_trigger_generation: true,
-          })
-        );
+        try {
+          const welcomeText = process.env.WELCOME_MESSAGE || "Hello, this is WiseOwl speaking. How can I help you today?";
+          fastify.log.info({ callSid, welcomeText, readyState: elevenWS.readyState }, 'ElevenLabs: sending immediate welcome message');
+          
+          if (elevenWS.readyState === WebSocket.OPEN) {
+            elevenWS.send(
+              JSON.stringify({
+                text: welcomeText,
+                try_trigger_generation: true,
+              })
+            );
+            fastify.log.info({ callSid }, 'ElevenLabs: welcome message sent successfully');
+          } else {
+            fastify.log.error({ callSid, readyState: elevenWS.readyState }, 'ElevenLabs: cannot send welcome - connection not open');
+          }
+        } catch (err) {
+          fastify.log.error({ err, callSid }, 'ElevenLabs: failed to send welcome message');
+        }
       }, 1000);
     });
 
