@@ -171,6 +171,9 @@ async function start() {
           const audio = Buffer.from(msg.audio, 'base64');
           fastify.log.info({ callSid, audioBytes: audio.length, twilioReady }, 'ElevenLabs: received audio - processing chunks');
           
+          // Send mark to signal start of audio playback
+          twilioSend(twilioWS, { event: 'mark', mark: { name: 'audio_start' } });
+          
           // Send audio regardless of twilioReady state - let Twilio buffer it
           let chunkCount = 0;
           for (const chunk of ulawChunks(audio)) {
