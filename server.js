@@ -295,6 +295,12 @@ async function start() {
               try_trigger_generation: true,
             })
           );
+          // Send end-of-input signal to finalize generation
+          setTimeout(() => {
+            if (elevenWS.readyState === WebSocket.OPEN) {
+              elevenWS.send(JSON.stringify({ text: "", xi_api_key: ELEVEN_API_KEY }));
+            }
+          }, 100);
         }
       } catch (err) {
         fastify.log.error({ err, callSid }, 'Claude processing failed');
@@ -307,6 +313,12 @@ async function start() {
               try_trigger_generation: true,
             })
           );
+          // Send end-of-input signal to finalize generation
+          setTimeout(() => {
+            if (elevenWS.readyState === WebSocket.OPEN) {
+              elevenWS.send(JSON.stringify({ text: "", xi_api_key: ELEVEN_API_KEY }));
+            }
+          }, 100);
         }
       }
     };
@@ -369,6 +381,12 @@ async function start() {
                     try_trigger_generation: true,
                   })
                 );
+                // Send end-of-input signal to finalize generation
+                setTimeout(() => {
+                  if (elevenWS.readyState === WebSocket.OPEN) {
+                    elevenWS.send(JSON.stringify({ text: "", xi_api_key: ELEVEN_API_KEY }));
+                  }
+                }, 100);
               } else {
                 fastify.log.warn({ callSid, readyState: elevenWS.readyState }, 'ElevenLabs not ready for welcome message');
               }
