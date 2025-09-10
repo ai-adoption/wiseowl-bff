@@ -32,7 +32,33 @@ fastify.get('/health', async () => ({ status: 'ok', timestamp: new Date().toISOS
 const deepgram = createDeepgramClient(DEEPGRAM_API_KEY);
 const anthropic = new Anthropic({ apiKey: ANTHROPIC_API_KEY });
 
-// ---- Utility: μ-law 8kHz frames (20ms = 160 bytes) for Twilio ----
+// ---- Utility: PCM to μ-law conversion and chunking for Twilio ----
+function pcmToUlaw(sample) {
+  // Simplified PCM 16-bit to μ-law conversion
+  const sign = (sample >> 8) & 0x80;
+  if (sign !== 0) sample = -sample;
+  if (sample > 32635) sample = 32635;
+  
+  sample = sample + 132;
+  let exponent = 7;
+  let expMask;
+  for (expMask = 0x4000; (sample & expMask) === 0 && exponent > 0; exponent--, expMask >>= 1);
+  
+  const mantissa = (sample >> (exponent + 3)) & 0x0F;
+  const ulaw = ~(sign | (exponent << 4) | mantissa);
+  
+  return ulaw & 0xFF;
+}
+
+function convertPcmToUlaw(pcmBuffer) {
+  const ulawBuffer = Buffer.alloc(pcmBuffer.length / 2);
+  for (let i = 0; i < pcmBuffer.length; i += 2) {
+    const sample = pcmBuffer.readInt16LE(i);
+    ulawBuffer[i / 2] = pcmToUlaw(sample);
+  }
+  return ulawBuffer;
+}
+
 function* ulawChunks(buf, size = 160) {
   for (let i = 0; i < buf.length; i += size) yield buf.slice(i, i + size);
 }
@@ -105,10 +131,10 @@ async function start() {
     }
 
     // ----- ElevenLabs: realtime TTS (stream-input) -----
-    // NOTE: the audio we request is ulaw_8000 (already μ-law at 8kHz) to send straight to Twilio
+    // NOTE: try pcm_16000 format for better compatibility, we'll convert to ulaw
     const elevenURL =
       `wss://api.elevenlabs.io/v1/text-to-speech/${ELEVEN_VOICE_ID}` +
-      `/stream-input?model_id=eleven_turbo_v2_5&output_format=ulaw_8000`;
+      `/stream-input?model_id=eleven_turbo_v2_5&output_format=pcm_16000`;
 
     const elevenWS = new WebSocket(elevenURL, { headers: { 'xi-api-key': ELEVEN_API_KEY } });
 
@@ -179,19 +205,23 @@ async function start() {
         }, 'ElevenLabs: received message');
         
         if (msg.audio) {
-          const audio = Buffer.from(msg.audio, 'base64');
-          fastify.log.info({ callSid, audioBytes: audio.length, twilioReady }, 'ElevenLabs: received audio - processing chunks');
+          const pcmAudio = Buffer.from(msg.audio, 'base64');
+          fastify.log.info({ callSid, pcmBytes: pcmAudio.length, twilioReady }, 'ElevenLabs: received PCM audio - converting to ulaw');
+          
+          // Convert PCM 16kHz to μ-law 8kHz for Twilio
+          const ulawAudio = convertPcmToUlaw(pcmAudio);
+          fastify.log.info({ callSid, ulawBytes: ulawAudio.length }, 'ElevenLabs: converted to ulaw');
           
           // Send mark to signal start of audio playback
           twilioSend(twilioWS, { event: 'mark', mark: { name: 'audio_start' } });
           
           // Send audio regardless of twilioReady state - let Twilio buffer it
           let chunkCount = 0;
-          for (const chunk of ulawChunks(audio)) {
+          for (const chunk of ulawChunks(ulawAudio)) {
             twilioSend(twilioWS, { event: 'media', media: { payload: chunk.toString('base64') } });
             chunkCount++;
           }
-          fastify.log.info({ callSid, chunkCount, twilioReady }, 'ElevenLabs: forwarded audio chunks to Twilio');
+          fastify.log.info({ callSid, chunkCount, twilioReady }, 'ElevenLabs: forwarded ulaw chunks to Twilio');
         }
         
         if (msg.isFinal) {
