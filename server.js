@@ -113,6 +113,7 @@ async function start() {
       elevenWS.send(
         JSON.stringify({
           text: ' ',
+          xi_api_key: ELEVEN_API_KEY,
           voice_settings: { stability: 0.5, similarity_boost: 0.8 },
           generation_config: { chunk_length_schedule: [120, 160, 250, 290] },
         })
@@ -290,6 +291,7 @@ async function start() {
           elevenWS.send(
             JSON.stringify({
               text: result.response_text,
+              xi_api_key: ELEVEN_API_KEY,
               try_trigger_generation: true,
             })
           );
@@ -300,7 +302,8 @@ async function start() {
         if (elevenWS.readyState === WebSocket.OPEN) {
           elevenWS.send(
             JSON.stringify({
-              text: "I'm sorry—I didn’t catch that. Could you repeat?",
+              text: "I'm sorry—I didn't catch that. Could you repeat?",
+              xi_api_key: ELEVEN_API_KEY,
               try_trigger_generation: true,
             })
           );
@@ -362,6 +365,7 @@ async function start() {
                 elevenWS.send(
                   JSON.stringify({
                     text: welcomeText,
+                    xi_api_key: ELEVEN_API_KEY,
                     try_trigger_generation: true,
                   })
                 );
