@@ -1,337 +1,398 @@
-/**
- * WiseOwl BFF — server.js
- * Fastify HTTP server + WebSocket bridge for Twilio Media Streams
- * Deepgram (ASR) → Anthropic Claude (reasoning) → ElevenLabs (TTS)
- * Supabase for persistence
- *
- * Env vars required:
- *  PORT                   - server port (Render provides one)
- *  DEEPGRAM_API_KEY       - Deepgram API key for ASR
- *  ANTHROPIC_API_KEY      - Claude API key
- *  CLAUDE_MODEL           - Claude model id (e.g., claude-3-7-sonnet-latest)
- *  ELEVEN_API_KEY         - ElevenLabs API key (TTS)
- *  ELEVEN_VOICE_ID        - ElevenLabs voice id
- *  SUPABASE_URL           - Supabase project URL
- *  SUPABASE_SERVICE_ROLE  - Supabase service role key
- *  JWT_SECRET             - (optional) secret for future WS auth
- */
+// server.js (ESM)
+// Minimal Fastify + ws BFF for Twilio Media Streams -> Deepgram -> Claude -> ElevenLabs
+//
+// ── Required ENV ──────────────────────────────────────────────────────────────
+// PORT                         (e.g. 3000; Render provides one for you)
+// DEEPGRAM_API_KEY             (Deepgram API key)
+// ANTHROPIC_API_KEY            (Anthropic Claude API key)
+// CLAUDE_MODEL                 (optional, default: "claude-3-5-sonnet-20241022")
+// ELEVEN_API_KEY               (ElevenLabs API key)
+// ELEVEN_VOICE_ID              (ElevenLabs voice ID for realtime TTS)
+// SUPABASE_URL                 (Supabase project URL)
+// SUPABASE_SERVICE_ROLE        (Supabase service-role key)
+// JWT_SECRET                   (arbitrary string; for future JWT use)
+// ─────────────────────────────────────────────────────────────────────────────
 
 import Fastify from 'fastify';
-import { WebSocketServer, WebSocket } from 'ws';
+import { WebSocketServer } from 'ws';
+import Anthropic from '@anthropic-ai/sdk';
 import { createClient as createDeepgramClient } from '@deepgram/sdk';
 import { createClient as createSupabaseClient } from '@supabase/supabase-js';
-import Anthropic from '@anthropic-ai/sdk';
-import { fetch } from 'undici'; // kept for completeness; SDKs use fetch internally
+import { fetch } from 'undici';
 
-// -------------------- Setup clients --------------------
+// ---------------------- Boot --------------------------------------------------
+
 const fastify = Fastify({ logger: true });
-const port = process.env.PORT || 3000;
+const PORT = Number(process.env.PORT || 3000);
 
-const deepgram = createDeepgramClient(process.env.DEEPGRAM_API_KEY);
+const DG = createDeepgramClient(process.env.DEEPGRAM_API_KEY);
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 const supabase = createSupabaseClient(
   process.env.SUPABASE_URL,
   process.env.SUPABASE_SERVICE_ROLE
 );
 
-// -------------------- Health --------------------
+const CLAUDE_MODEL =
+  process.env.CLAUDE_MODEL || 'claude-3-5-sonnet-20241022';
+const ELEVEN_API_KEY = process.env.ELEVEN_API_KEY;
+const ELEVEN_VOICE_ID = process.env.ELEVEN_VOICE_ID;
+
+if (!process.env.DEEPGRAM_API_KEY || !process.env.ANTHROPIC_API_KEY || !ELEVEN_API_KEY || !ELEVEN_VOICE_ID || !process.env.SUPABASE_URL || !process.env.SUPABASE_SERVICE_ROLE) {
+  console.error('❌ Missing one or more required environment variables.');
+}
+
+// ---------------------- Health ------------------------------------------------
+
 fastify.get('/health', async () => ({
   status: 'ok',
-  timestamp: new Date().toISOString(),
+  timestamp: new Date().toISOString()
 }));
 
-// -------------------- Helpers --------------------
-const chunkUlaw = (buf, size = 160) => {
-  const chunks = [];
-  for (let i = 0; i < buf.length; i += size) chunks.push(buf.slice(i, i + size));
-  return chunks;
+// ---------------------- Helpers ----------------------------------------------
+
+/** Sleep helper */
+const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+
+/** Send Twilio MediaStream control events */
+const twilioSend = (ws, obj) => {
+  if (ws.readyState === ws.OPEN) ws.send(JSON.stringify(obj));
 };
 
-const sendClear = (ws) => ws.send(JSON.stringify({ event: 'clear' }));
-const sendMark = (ws, name = 'playback_complete') =>
-  ws.send(JSON.stringify({ event: 'mark', mark: { name } }));
-
-// Persist a turn; non-blocking on failure
-async function persistTurn({ call_sid, role, text, meta }) {
-  try {
-    await supabase.from('turns').insert([
-      {
-        call_sid,
-        role,
-        text,
-        meta,
-      },
-    ]);
-  } catch (e) {
-    console.error('persistTurn error:', e);
+/** Chunk a Buffer to 20ms @ 8kHz μ-law (160 bytes) */
+function* ulawChunks(buf) {
+  const size = 160;
+  for (let i = 0; i < buf.length; i += size) {
+    yield buf.slice(i, i + size);
   }
 }
 
-// Upsert call row
-async function ensureCall(call_sid) {
+/** Very small schema “guard” for Claude tool output */
+function normalizeToolResult(res) {
+  const out = {
+    intent: 'unknown',
+    response_text: 'How can I help you?',
+    escalate: false,
+    slots: {}
+  };
+  if (res && typeof res === 'object') {
+    if (typeof res.intent === 'string' && res.intent.trim()) out.intent = res.intent.trim();
+    if (typeof res.response_text === 'string' && res.response_text.trim()) out.response_text = res.response_text.trim();
+    if (typeof res.escalate === 'boolean') out.escalate = res.escalate;
+    if (res.slots && typeof res.slots === 'object') out.slots = res.slots;
+  }
+  return out;
+}
+
+// ---------------------- WS: /stream (Twilio) ---------------------------------
+
+const wss = new WebSocketServer({ noServer: true });
+
+// Fastify HTTP server upgrade -> our WS server
+fastify.server.on('upgrade', (req, socket, head) => {
+  const { url } = req;
+  if (!url || !url.startsWith('/stream')) {
+    socket.destroy();
+    return;
+  }
+  wss.handleUpgrade(req, socket, head, (ws) => {
+    wss.emit('connection', ws, req);
+  });
+});
+
+wss.on('connection', async (twilioWS, req) => {
+  const url = new URL(req.url, `http://${req.headers.host}`);
+  const callSid = url.searchParams.get('callSid') || 'unknown';
+  fastify.log.info({ callSid }, 'Twilio WS connected');
+
+  // Persist call row
+  let callRow = null;
   try {
-    const { data } = await supabase
+    const { data, error } = await supabase
       .from('calls')
-      .upsert({ call_sid }, { onConflict: 'call_sid' })
+      .insert([{ call_sid: callSid, status: 'active', started_at: new Date() }])
       .select()
       .single();
-    return data;
+    if (error) throw error;
+    callRow = data;
   } catch (e) {
-    console.error('ensureCall error:', e);
-    return null;
+    fastify.log.error({ err: e }, 'Supabase: create call failed');
   }
-}
 
-// -------------------- ElevenLabs WS (TTS) --------------------
-function openElevenLabsWS() {
-  const voiceId = process.env.ELEVEN_VOICE_ID;
-  const model = 'eleven_turbo_v2_5';
-  const output = 'ulaw_8000';
-  const url = `wss://api.elevenlabs.io/v1/text-to-speech/${voiceId}/stream-input?model_id=${model}&output_format=${output}`;
+  // Keep-alive to avoid idle close (Twilio tolerates unused messages)
+  const keepAlive = setInterval(() => {
+    if (twilioWS.readyState === twilioWS.OPEN) {
+      twilioWS.ping?.();
+    }
+  }, 20000);
 
-  const ws = new WebSocket(url, {
-    headers: { 'xi-api-key': process.env.ELEVEN_API_KEY },
-  });
+  // ---------------- Deepgram realtime (μ-law, 8k) ---------------------------
 
-  ws.on('open', () => {
-    // optional initial config frame (kept minimal)
-    ws.send(
-      JSON.stringify({
-        text: ' ',
-        voice_settings: { stability: 0.5, similarity_boost: 0.8 },
-        generation_config: { chunk_length_schedule: [120, 160, 250, 290] },
-      })
-    );
-  });
-
-  return ws;
-}
-
-// -------------------- Deepgram Live --------------------
-function openDeepgramLive() {
-  return deepgram.listen.live({
+  const dgConn = DG.listen.live({
     model: 'nova-2',
     encoding: 'mulaw',
     sample_rate: 8000,
-    channels: 1,
     interim_results: true,
     smart_format: true,
     endpointing: 1500,
     utterance_end_ms: 1200,
+    channels: 1
   });
-}
 
-// -------------------- Claude reasoning --------------------
-async function reasonWithClaude(transcript) {
-  try {
-    const toolName = 'decide_and_respond';
-    const res = await anthropic.messages.create({
-      model: process.env.CLAUDE_MODEL || 'claude-3-7-sonnet-latest',
-      max_tokens: 800,
-      messages: [
-        {
+  dgConn.on('open', () => fastify.log.info({ callSid }, 'Deepgram live: open'));
+  dgConn.on('error', (e) => fastify.log.error({ err: e }, 'Deepgram error'));
+  dgConn.on('close', () => fastify.log.info({ callSid }, 'Deepgram live: closed'));
+
+  // Buffer final text until an endpoint
+  let pendingText = '';
+  let processing = false;
+
+  // ---------------- ElevenLabs realtime TTS ---------------------------------
+  // IMPORTANT: ElevenLabs realtime requires API key as a HEADER. If you omit it,
+  // the WS will close immediately. That’s likely why you saw “WS closed: unknown”.
+  import('ws').then(({ default: WebSocket }) => {
+    // Note: specify output_format=ulaw_8000 to match Twilio media stream
+    const elevenURL = `wss://api.elevenlabs.io/v1/text-to-speech/${ELEVEN_VOICE_ID}/stream-input?model_id=eleven_turbo_v2_5&output_format=ulaw_8000`;
+    const elevenWS = new WebSocket(elevenURL, {
+      headers: {
+        'xi-api-key': ELEVEN_API_KEY,
+        'accept': 'audio/mpeg' // they accept this even for ulaw streaming
+      }
+    });
+
+    const elevenPing = setInterval(() => {
+      if (elevenWS.readyState === elevenWS.OPEN) {
+        elevenWS.ping();
+      }
+    }, 20000);
+
+    elevenWS.on('open', () => {
+      fastify.log.info({ callSid }, 'ElevenLabs WS: open');
+
+      // (Optional) prime session with basic settings to reduce first-audio delay
+      const init = {
+        text: ' ',
+        voice_settings: { stability: 0.5, similarity_boost: 0.8 },
+        generation_config: { chunk_length_schedule: [120, 160, 250, 290] }
+      };
+      elevenWS.send(JSON.stringify(init));
+    });
+
+    elevenWS.on('message', (data) => {
+      // ElevenLabs realtime sends small JSON envelopes; audio payload is base64
+      try {
+        const msg = JSON.parse(data.toString('utf8'));
+        if (msg.audio) {
+          const audio = Buffer.from(msg.audio, 'base64');
+          for (const chunk of ulawChunks(audio)) {
+            twilioSend(twilioWS, {
+              event: 'media',
+              media: { payload: chunk.toString('base64') }
+            });
+          }
+        }
+        if (msg.isFinal) {
+          // Signal playback complete (helps if you chain prompts)
+          twilioSend(twilioWS, { event: 'mark', mark: { name: 'playback_complete' } });
+        }
+      } catch (e) {
+        // Some messages aren’t JSON (pongs). Ignore safely.
+      }
+    });
+
+    elevenWS.on('close', () => fastify.log.info({ callSid }, 'ElevenLabs WS: closed'));
+    elevenWS.on('error', (e) => fastify.log.error({ err: e }, 'ElevenLabs WS error'));
+
+    // --------------- Deepgram -> Claude -> ElevenLabs pipeline --------------
+
+    const runClaude = async (finalText) => {
+      try {
+        // Save user turn
+        await supabase.from('turns').insert([{
+          call_id: callRow?.id ?? null,
           role: 'user',
-          content: `You are a polite, concise AI receptionist. Given this caller text, produce a structured response.\n\nCaller: "${transcript}"`,
-        },
-      ],
-      tools: [
-        {
-          name: toolName,
-          description:
-            'Decide the caller intent, produce a brief response text, whether to escalate, and any extracted slots.',
-          input_schema: {
-            type: 'object',
-            properties: {
-              intent: { type: 'string' },
-              response_text: { type: 'string' },
-              escalate: { type: 'boolean' },
-              slots: { type: 'object', additionalProperties: { type: 'string' } },
-            },
-            required: ['intent', 'response_text', 'escalate', 'slots'],
-          },
-        },
-      ],
-      tool_choice: { type: 'tool', name: toolName },
-    });
+          content: finalText,
+          created_at: new Date()
+        }]);
 
-    // Extract tool output (with simple auto-repair)
-    let result = {
-      intent: 'unknown',
-      response_text: "I'm here to help. How can I assist you?",
-      escalate: false,
-      slots: {},
-    };
-
-    const content = res?.content?.[0];
-    if (content?.type === 'tool_use' && content?.input) {
-      const i = content.input;
-      result.intent = typeof i.intent === 'string' ? i.intent : result.intent;
-      result.response_text =
-        typeof i.response_text === 'string' ? i.response_text : result.response_text;
-      result.escalate = typeof i.escalate === 'boolean' ? i.escalate : result.escalate;
-      result.slots = i.slots && typeof i.slots === 'object' ? i.slots : result.slots;
-    }
-
-    return result;
-  } catch (e) {
-    console.error('Claude reasoning error:', e);
-    return {
-      intent: 'fallback',
-      response_text: "I'm sorry, could you please repeat that?",
-      escalate: false,
-      slots: {},
-    };
-  }
-}
-
-// -------------------- WebSocket: /stream (Twilio Media Streams) --------------------
-async function start() {
-  try {
-    await fastify.listen({ port, host: '0.0.0.0' });
-    console.log(`WiseOwl BFF running on ${port}`);
-
-    const wss = new WebSocketServer({ server: fastify.server, path: '/stream' });
-
-    wss.on('connection', async (ws, req) => {
-      // Parse CallSid from query
-      const u = new URL(req.url, `http://${req.headers.host}`);
-      const callSid = u.searchParams.get('callSid') || 'unknown';
-      console.log('Twilio WS connected:', callSid);
-
-      // Session state
-      let transcriptBuffer = '';
-      let speaking = false;
-      let dg = openDeepgramLive();
-      let eleven = openElevenLabsWS();
-
-      // DB: ensure call row exists
-      await ensureCall(callSid);
-
-      // Deepgram events
-      dg.on('open', () => console.log('Deepgram live: open'));
-      dg.on('error', (e) => console.error('Deepgram error:', e));
-      dg.on('close', () => console.log('Deepgram live: closed'));
-
-      dg.on('transcript', async (msg) => {
-        const alt = msg?.channel?.alternatives?.[0];
-        const text = alt?.transcript || '';
-        if (!text) return;
-
-        if (msg.is_final || msg.speech_final) {
-          transcriptBuffer += text + ' ';
-          // Got a full piece of speech → reason → speak
-          const userText = transcriptBuffer.trim();
-          transcriptBuffer = '';
-
-          // Persist user turn
-          persistTurn({ call_sid: callSid, role: 'user', text: userText, meta: { final: true } });
-
-          const result = await reasonWithClaude(userText);
-
-          // Persist assistant + intents
-          persistTurn({
-            call_sid: callSid,
-            role: 'assistant',
-            text: result.response_text,
-            meta: { intent: result.intent, escalate: result.escalate, slots: result.slots },
-          });
-          try {
-            await supabase.from('intents').insert([
-              {
-                call_sid: callSid,
-                intent: result.intent,
-                escalate: result.escalate,
-                slots: result.slots,
+        // Ask Claude with a structured tool output
+        const resp = await anthropic.messages.create({
+          model: CLAUDE_MODEL,
+          max_tokens: 1000,
+          messages: [{
+            role: 'user',
+            content: `You are WiseOwl, a helpful AI receptionist. Be concise, warm, and helpful.\nCaller said: "${finalText}"`
+          }],
+          tools: [{
+            name: 'receptionist_response',
+            description: 'Return an actionable reply for a caller.',
+            input_schema: {
+              type: 'object',
+              properties: {
+                intent: { type: 'string' },
+                response_text: { type: 'string' },
+                escalate: { type: 'boolean' },
+                slots: { type: 'object', additionalProperties: true }
               },
-            ]);
-          } catch (e) {
-            console.error('persist intent error:', e);
-          }
-
-          // Barge-in: clear any current playback
-          if (speaking) sendClear(ws);
-
-          // Speak via ElevenLabs
-          if (eleven.readyState === WebSocket.OPEN) {
-            speaking = true;
-            eleven.send(JSON.stringify({ text: result.response_text, try_trigger_generation: true }));
-          }
-        } else {
-          // interim: barge-in if caller starts talking while TTS
-          if (!speaking) return;
-          sendClear(ws);
-          speaking = false;
-        }
-      });
-
-      // ElevenLabs audio → Twilio
-      eleven.on('message', (data) => {
-        try {
-          const m = JSON.parse(data.toString());
-          if (m?.audio) {
-            const audio = Buffer.from(m.audio, 'base64');
-            // send as 20ms µ-law frames (160 bytes @ 8kHz)
-            for (const chunk of chunkUlaw(audio, 160)) {
-              ws.send(JSON.stringify({ event: 'media', media: { payload: chunk.toString('base64') } }));
+              required: ['intent', 'response_text', 'escalate', 'slots']
             }
-          }
-          if (m?.isFinal) {
-            sendMark(ws, 'tts_done');
-            speaking = false;
-          }
-        } catch (e) {
-          // Sometimes ElevenLabs sends non-JSON keepalives; ignore
-        }
-      });
-      eleven.on('open', () => console.log('ElevenLabs WS: open'));
-      eleven.on('error', (e) => console.error('ElevenLabs WS error:', e));
-      eleven.on('close', () => console.log('ElevenLabs WS: closed'));
+          }],
+          tool_choice: { type: 'tool', name: 'receptionist_response' }
+        });
 
-      // Twilio → events
-      ws.on('message', (raw) => {
-        try {
-          const msg = JSON.parse(raw.toString());
-          if (msg.event === 'start') {
-            console.log('Twilio start:', msg?.start?.streamSid);
-          } else if (msg.event === 'media') {
-            // Forward audio to Deepgram (base64 µ-law)
-            if (dg?.readyState === WebSocket.OPEN) {
-              const buf = Buffer.from(msg.media.payload, 'base64');
-              dg.send(buf);
-            }
-          } else if (msg.event === 'stop') {
-            console.log('Twilio stop');
-            ws.close();
-          }
-        } catch (e) {
-          console.error('WS message parse error:', e);
+        let tool;
+        const first = resp.content[0];
+        if (first?.type === 'tool_use' && first.name === 'receptionist_response') {
+          tool = first.input;
         }
-      });
+        const out = normalizeToolResult(tool);
 
-      ws.on('close', async () => {
-        try {
-          dg?.finish?.();
-        } catch (_) {}
-        try {
-          if (eleven?.readyState === WebSocket.OPEN) eleven.close();
-        } catch (_) {}
-        try {
-          await supabase
-            .from('calls')
-            .update({ ended_at: new Date() })
-            .eq('call_sid', callSid);
-        } catch (e) {
-          console.error('update call end error:', e);
+        // Save assistant turn + intent
+        await Promise.all([
+          supabase.from('turns').insert([{
+            call_id: callRow?.id ?? null,
+            role: 'assistant',
+            content: out.response_text,
+            created_at: new Date()
+          }]),
+          supabase.from('intents').insert([{
+            call_id: callRow?.id ?? null,
+            intent: out.intent,
+            confidence: 1.0,
+            slots: out.slots,
+            escalate: out.escalate,
+            created_at: new Date()
+          }])
+        ]);
+
+        // Barge-in: clear any playing audio on Twilio side
+        twilioSend(twilioWS, { event: 'clear' });
+
+        // Speak via ElevenLabs realtime
+        if (elevenWS.readyState === elevenWS.OPEN) {
+          elevenWS.send(JSON.stringify({
+            text: out.response_text,
+            try_trigger_generation: true
+          }));
         }
-        console.log('Twilio WS closed:', callSid);
-      });
+      } catch (e) {
+        fastify.log.error({ err: e }, 'Claude pipeline error');
 
-      ws.on('error', (e) => console.error('Twilio WS error:', e));
+        twilioSend(twilioWS, { event: 'clear' });
+        if (elevenWS.readyState === elevenWS.OPEN) {
+          elevenWS.send(JSON.stringify({
+            text: "I'm sorry, I didn’t catch that. Could you say that again?",
+            try_trigger_generation: true
+          }));
+        }
+      }
+    };
+
+    // Deepgram transcripts
+    dgConn.on('transcript', async (dg) => {
+      const text = dg?.channel?.alternatives?.[0]?.transcript || '';
+      if (!text) return;
+
+      if (dg.speech_final || dg.is_final) {
+        pendingText += (pendingText ? ' ' : '') + text;
+        fastify.log.info({ callSid, text }, 'Deepgram final');
+
+        if (!processing) {
+          processing = true;
+          const toProcess = pendingText.trim();
+          pendingText = '';
+          await runClaude(toProcess);
+          processing = false;
+        }
+      } else {
+        // interim
+        fastify.log.debug({ callSid, text }, 'Deepgram interim');
+      }
     });
-  } catch (err) {
-    fastify.log.error(err);
-    process.exit(1);
-  }
-}
 
-start();
+    dgConn.on('utteranceEnd', async () => {
+      if (pendingText && !processing) {
+        processing = true;
+        const toProcess = pendingText.trim();
+        pendingText = '';
+        await runClaude(toProcess);
+        processing = false;
+      }
+    });
+
+    // --------------- Twilio inbound media handling ---------------------------
+
+    let streamSid = null;
+
+    twilioWS.on('message', (raw) => {
+      try {
+        const msg = JSON.parse(raw.toString('utf8'));
+        switch (msg.event) {
+          case 'start':
+            streamSid = msg.start?.streamSid || streamSid;
+            fastify.log.info({ callSid, streamSid }, 'Twilio start');
+            break;
+
+          case 'media': {
+            // Twilio sends μ-law base64 frames; forward to Deepgram
+            if (dgConn && dgConn.send) {
+              const audio = Buffer.from(msg.media?.payload || '', 'base64');
+              if (audio.length) dgConn.send(audio);
+            }
+            break;
+          }
+
+          case 'mark':
+            fastify.log.info({ callSid, mark: msg.mark?.name }, 'Twilio mark');
+            break;
+
+          case 'stop':
+            fastify.log.info({ callSid, streamSid }, 'Twilio stop');
+            cleanup();
+            break;
+        }
+      } catch (e) {
+        fastify.log.error({ err: e }, 'Twilio WS message parse error');
+      }
+    });
+
+    twilioWS.on('close', () => {
+      fastify.log.info({ callSid }, 'Twilio WS closed');
+      cleanup();
+    });
+
+    twilioWS.on('error', (e) => {
+      fastify.log.error({ err: e }, 'Twilio WS error');
+      cleanup();
+    });
+
+    async function cleanup() {
+      clearInterval(keepAlive);
+      clearInterval(elevenPing);
+
+      try { dgConn.finish?.(); } catch {}
+      try { elevenWS.close?.(); } catch {}
+
+      if (callRow?.id) {
+        try {
+          await supabase.from('calls')
+            .update({ status: 'completed', ended_at: new Date() })
+            .eq('id', callRow.id);
+        } catch (e) {
+          fastify.log.error({ err: e }, 'Supabase: update call failed');
+        }
+      }
+    }
+  }).catch((e) => {
+    fastify.log.error({ err: e }, 'Failed to load ws module for ElevenLabs');
+  });
+});
+
+// ---------------------- Start -------------------------------------------------
+
+try {
+  await fastify.listen({ port: PORT, host: '0.0.0.0' });
+  fastify.log.info(`Server listening on 0.0.0.0:${PORT}`);
+} catch (err) {
+  fastify.log.error(err);
+  process.exit(1);
+}
