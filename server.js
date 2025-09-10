@@ -130,10 +130,19 @@ async function start() {
             elevenWS.send(
               JSON.stringify({
                 text: welcomeText,
+                xi_api_key: ELEVEN_API_KEY,
                 try_trigger_generation: true,
               })
             );
             fastify.log.info({ callSid }, 'ElevenLabs: welcome message sent successfully');
+            
+            // Send end-of-input signal to finalize generation
+            setTimeout(() => {
+              if (elevenWS.readyState === WebSocket.OPEN) {
+                elevenWS.send(JSON.stringify({ text: "", xi_api_key: ELEVEN_API_KEY }));
+                fastify.log.info({ callSid }, 'ElevenLabs: sent end-of-input signal');
+              }
+            }, 100);
           } else {
             fastify.log.error({ callSid, readyState: elevenWS.readyState }, 'ElevenLabs: cannot send welcome - connection not open');
           }
