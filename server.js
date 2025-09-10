@@ -146,9 +146,20 @@ async function start() {
       // ElevenLabs realtime messages are JSON; audio frames are base64 μ-law
       try {
         const msg = JSON.parse(data.toString('utf8'));
+        
+        // Log ALL message types from ElevenLabs for debugging
+        fastify.log.info({ 
+          callSid, 
+          messageType: Object.keys(msg), 
+          hasAudio: !!msg.audio,
+          audioSize: msg.audio ? msg.audio.length : 0,
+          isFinal: !!msg.isFinal,
+          fullMessage: JSON.stringify(msg).substring(0, 200) 
+        }, 'ElevenLabs: received message');
+        
         if (msg.audio) {
           const audio = Buffer.from(msg.audio, 'base64');
-          fastify.log.debug({ callSid, audioBytes: audio.length, twilioReady }, 'ElevenLabs: received audio');
+          fastify.log.info({ callSid, audioBytes: audio.length, twilioReady }, 'ElevenLabs: received audio - processing chunks');
           
           // Send audio regardless of twilioReady state - let Twilio buffer it
           let chunkCount = 0;
@@ -156,15 +167,29 @@ async function start() {
             twilioSend(twilioWS, { event: 'media', media: { payload: chunk.toString('base64') } });
             chunkCount++;
           }
-          fastify.log.debug({ callSid, chunkCount, twilioReady }, 'ElevenLabs: forwarded audio chunks to Twilio');
+          fastify.log.info({ callSid, chunkCount, twilioReady }, 'ElevenLabs: forwarded audio chunks to Twilio');
         }
+        
         if (msg.isFinal) {
-          fastify.log.debug({ callSid }, 'ElevenLabs: generation complete');
+          fastify.log.info({ callSid }, 'ElevenLabs: generation complete');
           // mark after playback complete (helps keep Twilio/Eleven state in sync)
           twilioSend(twilioWS, { event: 'mark', mark: { name: 'playback_complete' } });
         }
-      } catch {
-        // ignore non-JSON (e.g., pongs)
+        
+        // Log any other message properties
+        const otherProps = Object.keys(msg).filter(k => k !== 'audio' && k !== 'isFinal');
+        if (otherProps.length > 0) {
+          fastify.log.info({ callSid, otherProps, values: otherProps.map(k => msg[k]) }, 'ElevenLabs: other message properties');
+        }
+        
+      } catch (parseError) {
+        // Log parse errors for debugging
+        fastify.log.warn({ 
+          callSid, 
+          error: parseError.message,
+          dataLength: data.length,
+          dataPreview: data.toString('utf8').substring(0, 100) 
+        }, 'ElevenLabs: non-JSON message received');
       }
     });
 
