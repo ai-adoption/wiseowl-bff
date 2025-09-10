@@ -147,17 +147,57 @@ wss.on('connection', async (twilioWS, req) => {
   let processing = false;
 
   // ---------------- ElevenLabs realtime TTS ---------------------------------
-  // IMPORTANT: ElevenLabs realtime requires API key as a HEADER. If you omit it,
-  // the WS will close immediately. That’s likely why you saw “WS closed: unknown”.
-  import('ws').then(({ default: WebSocket }) => {
-    // Note: specify output_format=ulaw_8000 to match Twilio media stream
-    const elevenURL = `wss://api.elevenlabs.io/v1/text-to-speech/${ELEVEN_VOICE_ID}/stream-input?model_id=eleven_turbo_v2_5&output_format=ulaw_8000`;
-    const elevenWS = new WebSocket(elevenURL, {
-      headers: {
-        'xi-api-key': ELEVEN_API_KEY,
-        'accept': 'audio/mpeg' // they accept this even for ulaw streaming
+ function connectElevenLabs(ws /* Twilio WS */) {
+  const voiceId = process.env.ELEVEN_VOICE_ID; // <-- from Render env
+  const wsUrl = `wss://api.elevenlabs.io/v1/text-to-speech/${voiceId}/stream-input?model_id=eleven_turbo_v2_5&output_format=ulaw_8000`;
+
+  // Pass API key in WS headers
+  const elevenLabsWs = new WebSocket(wsUrl, {
+    headers: { 'xi-api-key': process.env.ELEVEN_API_KEY }
+  });
+
+  elevenLabsWs.on('open', () => {
+    console.log('ElevenLabs WebSocket connected');
+
+    // Initial server-side config (keep)
+    elevenLabsWs.send(JSON.stringify({
+      text: ' ',
+      voice_settings: { stability: 0.5, similarity_boost: 0.8 },
+      generation_config: { chunk_length_schedule: [120, 160, 250, 290] }
+    }));
+
+    // 🔊 Send the welcome message immediately
+    const welcome = process.env.WELCOME_MESSAGE || "Hi! You're through to WiseOwl. How can I help?";
+    elevenLabsWs.send(JSON.stringify({
+      text: welcome,
+      try_trigger_generation: true
+    }));
+  });
+
+  elevenLabsWs.on('message', (data) => {
+    try {
+      const msg = JSON.parse(data);
+      if (msg.audio) {
+        const audioBuffer = Buffer.from(msg.audio, 'base64');
+        const chunkSize = 160; // 20ms at 8kHz μ-law
+        for (let i = 0; i < audioBuffer.length; i += chunkSize) {
+          const chunk = audioBuffer.slice(i, i + chunkSize);
+          const payload = chunk.toString('base64');
+          ws.send(JSON.stringify({ event: 'media', media: { payload } }));
+        }
       }
-    });
+      if (msg.isFinal) {
+        ws.send(JSON.stringify({ event: 'mark', mark: { name: 'playback_complete' } }));
+      }
+    } catch (err) {
+      console.error('Error processing ElevenLabs audio:', err);
+    }
+  });
+
+  elevenLabsWs.on('error', (err) => console.error('ElevenLabs WS error:', err));
+  elevenLabsWs.on('close', () => console.log('ElevenLabs WS closed'));
+  return elevenLabsWs;
+}
 
     const elevenPing = setInterval(() => {
       if (elevenWS.readyState === elevenWS.OPEN) {
