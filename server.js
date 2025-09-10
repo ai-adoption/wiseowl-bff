@@ -385,6 +385,7 @@ async function start() {
                 setTimeout(() => {
                   if (elevenWS.readyState === WebSocket.OPEN) {
                     elevenWS.send(JSON.stringify({ text: "", xi_api_key: ELEVEN_API_KEY }));
+                    fastify.log.info({ callSid }, 'ElevenLabs: sent end-of-input signal');
                   }
                 }, 100);
               } else {
