@@ -364,7 +364,7 @@ async function start() {
     });
 
     // ----- Twilio sync state -----
-    let twilioReady = false;
+    let twilioReady = true; // Force ready - Twilio start event unreliable
     let elevenReady = false;
 
     // ----- Twilio WS messages -----
