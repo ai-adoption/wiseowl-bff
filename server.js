@@ -51,8 +51,13 @@ async function start() {
   wss.on('connection', async (twilioWS, req) => {
     const params = new URL(req.url, `http://${req.headers.host}`).searchParams;
     const callSid = params.get('callSid') || 'unknown';
-
-    fastify.log.info({ callSid }, 'Twilio WS connected');
+    
+    // Debug: log full URL and parameters
+    fastify.log.info({ 
+      callSid, 
+      fullUrl: req.url,
+      allParams: Object.fromEntries(params.entries())
+    }, 'Twilio WS connected');
 
     // ----- Supabase: open call record -----
     const supabase = createSupabaseClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE);
